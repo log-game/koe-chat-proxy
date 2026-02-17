@@ -1,0 +1,6 @@
+{
+  "name": "koe-chat-proxy",
+  "version": "1.0.0",
+  "description": "Telegram proxy for KOE CHAT",
+  "main": "api/proxy.js"
+}
