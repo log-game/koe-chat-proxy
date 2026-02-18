@@ -3,7 +3,7 @@ export default async function handler(req, res) {
   // ===== НАСТРОЙКИ =====
   const TOKEN = '8550352315:AAEQ0Ixpe17_YEWiJD4RLhAs5BbqIoUirmY';
   const CHAT_ID = '-1002168026878'; // ID супергруппы КОЕ ЧАТ
-  const BOT_USERNAME = 'YourBotUsername'; // !!! ЗАМЕНИТЕ НА ИМЯ ВАШЕГО БОТА (без @)
+  const BOT_USERNAME = '@koemess_bot'; // !!! ЗАМЕНИТЕ НА ИМЯ ВАШЕГО БОТА (без @)
 
   // Настройки CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
