@@ -1,12 +1,12 @@
-// api/proxy.js - СТАБИЛЬНАЯ ВЕРСИЯ
+// api/proxy.js - ПОЛНАЯ РАБОЧАЯ ВЕРСИЯ
 const TOKEN = '8550352315:AAEQ0Ixpe17_YEWiJD4RLhAs5BbqIoUirmY';
-const CHAT_ID = '-1002168026878';
+const CHAT_ID = '-1002168026878'; // ID супергруппы КОЕ ЧАТ
 
-// Используем глобальное хранилище (в Vercel оно сохраняется между вызовами)
-// НО! При перезапуске функции данные всё равно сбросятся
-// Для продакшена нужно использовать базу данных, но для теста сойдёт
-const authStore = new Map();
-const messageStore = new Map();
+// Хранилища (в памяти Vercel)
+const authCodes = new Map(); // коды авторизации
+const siteMessages = []; // сообщения с сайта
+const userSpam = new Map(); // для анти-спама { userId: [timestamps] }
+const bannedUsers = new Set(); // заглушка для банов (в реальности нужно получать из Telegram)
 
 export default async function handler(req, res) {
   // CORS настройки
@@ -21,79 +21,84 @@ export default async function handler(req, res) {
 
   const { action } = req.query;
 
-  // ===== ПОЛУЧЕНИЕ СООБЩЕНИЙ =====
+  // ===== 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ =====
   if (action === 'getMessages') {
     try {
-      console.log('Fetching messages from Telegram...');
-      
-      // Получаем сообщения из Telegram
       const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates`);
       const data = await response.json();
       
-      let messages = [];
-      
+      let telegramMessages = [];
       if (data.ok && data.result) {
-        messages = data.result
-          .filter(item => {
-            return item.message && 
-                   item.message.chat && 
-                   item.message.chat.id == CHAT_ID &&
-                   item.message.text;
-          })
+        telegramMessages = data.result
+          .filter(item => item.message && item.message.chat.id == CHAT_ID)
           .map(item => {
             const msg = item.message;
+            const from = msg.from;
+            
             return {
               id: msg.message_id,
-              text: msg.text,
-              date: msg.date,
-              fromId: msg.from.id,
-              fromName: msg.from.first_name,
-              fromUsername: msg.from.username,
-              isFromBot: msg.from.is_bot || false
+              text: msg.text || '',
+              fromId: from.id,
+              fromName: from.first_name + (from.last_name ? ' ' + from.last_name : ''),
+              fromUsername: from.username,
+              isFromSite: from.is_bot || false,
+              date: msg.date
             };
           });
       }
       
-      console.log(`Found ${messages.length} messages from Telegram`);
-      
-      // Добавляем сообщения из нашего хранилища (отправленные с сайта)
-      const siteMessages = [];
-      messageStore.forEach((value, key) => {
-        siteMessages.push(value);
-      });
-      
-      console.log(`Found ${siteMessages.length} messages from site store`);
-      
-      // Объединяем и сортируем
-      const allMessages = [...messages, ...siteMessages]
+      // Объединяем с сообщениями с сайта
+      const allMessages = [...siteMessages, ...telegramMessages]
         .sort((a, b) => a.date - b.date);
       
-      res.status(200).json({ 
-        ok: true, 
-        messages: allMessages,
-        count: allMessages.length
-      });
-      
+      res.status(200).json({ ok: true, messages: allMessages });
     } catch (error) {
-      console.error('Error:', error);
       res.status(500).json({ ok: false, error: error.toString() });
     }
     return;
   }
 
-  // ===== ОТПРАВКА СООБЩЕНИЯ =====
+  // ===== 2. ОТПРАВКА СООБЩЕНИЯ =====
   if (action === 'sendMessage' && req.method === 'POST') {
     try {
-      const { text, parse_mode, userId, userName } = req.body;
+      const { text, parse_mode, userId, username, first_name } = req.body;
       
+      // ===== АНТИ-СПАМ ПРОВЕРКА =====
+      const now = Date.now();
+      const userTimestamps = userSpam.get(userId) || [];
+      const recentMessages = userTimestamps.filter(t => now - t < 60000); // за последнюю минуту
+      
+      if (recentMessages.length >= 5) {
+        res.status(429).json({ 
+          ok: false, 
+          error: 'SPAM_LIMIT',
+          message: 'Слишком много сообщений. Подождите минуту.'
+        });
+        return;
+      }
+      
+      // ===== ПРОВЕРКА БАНА/МУТА =====
+      // В реальности нужно проверять через Telegram API статус участника
+      // Это заглушка - проверяем наличие в Set
+      if (bannedUsers.has(userId)) {
+        res.status(403).json({ 
+          ok: false, 
+          error: 'USER_BANNED',
+          message: 'Вы забанены в чате'
+        });
+        return;
+      }
+      
+      // Формируем имя для отображения
+      const displayName = username ? `@${username}` : (first_name || 'Пользователь');
+      const messageText = `<a href="tg://user?id=${userId}">${displayName}</a>: ${text}`;
+      
+      // Отправляем в Telegram
       const params = {
         chat_id: CHAT_ID,
-        text: text
+        text: messageText,
+        parse_mode: 'HTML'
       };
-      
-      if (parse_mode) {
-        params.parse_mode = parse_mode;
-      }
       
       const response = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
         method: 'POST',
@@ -103,43 +108,44 @@ export default async function handler(req, res) {
       
       const data = await response.json();
       
-      // Сохраняем сообщение в наше хранилище
+      // Если успешно - сохраняем
       if (data.ok) {
-        const messageId = Date.now();
-        messageStore.set(messageId.toString(), {
-          id: messageId,
-          text: text.replace(/<[^>]*>/g, ''), // очищаем от HTML
-          date: Math.floor(Date.now() / 1000),
-          fromId: userId || 0,
-          fromName: userName || 'User',
-          isFromBot: true,
-          isFromSite: true
+        // Обновляем спам-счетчик
+        userTimestamps.push(now);
+        userSpam.set(userId, userTimestamps.filter(t => now - t < 60000));
+        
+        // Сохраняем сообщение локально
+        siteMessages.push({
+          id: `site_${Date.now()}`,
+          text: text,
+          fromId: userId,
+          fromName: displayName,
+          fromUsername: username,
+          isFromSite: true,
+          date: Math.floor(now / 1000)
         });
         
-        // Очищаем старые сообщения (оставляем последние 100)
-        if (messageStore.size > 100) {
-          const keys = Array.from(messageStore.keys()).slice(0, messageStore.size - 100);
-          keys.forEach(key => messageStore.delete(key));
+        // Ограничиваем историю
+        if (siteMessages.length > 100) {
+          siteMessages.splice(0, siteMessages.length - 100);
         }
       }
       
       res.status(200).json(data);
-      
     } catch (error) {
-      console.error('Send error:', error);
-      res.status(500).json({ error: error.toString() });
+      res.status(500).json({ ok: false, error: error.toString() });
     }
     return;
   }
 
-  // ===== ПРОВЕРКА АВТОРИЗАЦИИ =====
+  // ===== 3. АВТОРИЗАЦИЯ =====
   if (action === 'checkAuth') {
     try {
       const { code } = req.query;
       
-      if (authStore.has(code)) {
-        const user = authStore.get(code);
-        authStore.delete(code);
+      if (authCodes.has(code)) {
+        const user = authCodes.get(code);
+        authCodes.delete(code);
         res.status(200).json({ ok: true, user });
       } else {
         res.status(200).json({ ok: false });
@@ -150,7 +156,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ===== ВЕБХУК =====
+  // ===== 4. ВЕБХУК ДЛЯ БОТА =====
   if (action === 'webhook' && req.method === 'POST') {
     try {
       const body = req.body;
@@ -163,7 +169,7 @@ export default async function handler(req, res) {
           first_name: body.message.from.first_name
         };
         
-        authStore.set(authCode, user);
+        authCodes.set(authCode, user);
         
         await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
           method: 'POST',
@@ -174,7 +180,7 @@ export default async function handler(req, res) {
           })
         });
         
-        setTimeout(() => authStore.delete(authCode), 300000);
+        setTimeout(() => authCodes.delete(authCode), 300000); // 5 минут
       }
       
       res.status(200).json({ ok: true });
@@ -185,17 +191,32 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ===== ТЕСТ =====
+  // ===== 5. ТЕСТОВЫЙ ЭНДПОИНТ =====
   if (action === 'test') {
     res.status(200).json({ 
       ok: true, 
       message: 'Proxy is working',
       chatId: CHAT_ID,
-      authCount: authStore.size,
-      messageCount: messageStore.size
+      time: Date.now()
     });
     return;
   }
 
-  res.status(404).json({ error: 'Action not found' });
+  // ===== 6. GET UPDATES ДЛЯ СОВМЕСТИМОСТИ =====
+  if (action === 'getUpdates') {
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates`);
+      const data = await response.json();
+      res.status(200).json(data);
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.toString() });
+    }
+    return;
+  }
+
+  res.status(404).json({ 
+    ok: false, 
+    error: 'Action not found',
+    availableActions: ['test', 'getMessages', 'getUpdates', 'sendMessage', 'checkAuth', 'webhook']
+  });
 }
