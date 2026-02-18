@@ -1,9 +1,12 @@
-// api/proxy.js - РАБОЧАЯ ВЕРСИЯ
+// api/proxy.js - СТАБИЛЬНАЯ ВЕРСИЯ
 const TOKEN = '8550352315:AAEQ0Ixpe17_YEWiJD4RLhAs5BbqIoUirmY';
 const CHAT_ID = '-1002168026878';
 
-// Хранилище для кодов авторизации
-const authCodes = new Map();
+// Используем глобальное хранилище (в Vercel оно сохраняется между вызовами)
+// НО! При перезапуске функции данные всё равно сбросятся
+// Для продакшена нужно использовать базу данных, но для теста сойдёт
+const authStore = new Map();
+const messageStore = new Map();
 
 export default async function handler(req, res) {
   // CORS настройки
@@ -18,27 +21,24 @@ export default async function handler(req, res) {
 
   const { action } = req.query;
 
-  // ===== ПОЛУЧЕНИЕ СООБЩЕНИЙ (ИСПРАВЛЕНО!) =====
+  // ===== ПОЛУЧЕНИЕ СООБЩЕНИЙ =====
   if (action === 'getMessages') {
     try {
-      console.log('Fetching updates from Telegram...');
+      console.log('Fetching messages from Telegram...');
       
-      // Получаем обновления из Telegram
+      // Получаем сообщения из Telegram
       const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates`);
       const data = await response.json();
-      
-      console.log('Telegram response:', JSON.stringify(data).substring(0, 200) + '...');
       
       let messages = [];
       
       if (data.ok && data.result) {
-        // Фильтруем только сообщения из нашего чата
         messages = data.result
           .filter(item => {
             return item.message && 
                    item.message.chat && 
                    item.message.chat.id == CHAT_ID &&
-                   item.message.text; // только текстовые сообщения
+                   item.message.text;
           })
           .map(item => {
             const msg = item.message;
@@ -49,21 +49,33 @@ export default async function handler(req, res) {
               fromId: msg.from.id,
               fromName: msg.from.first_name,
               fromUsername: msg.from.username,
-              isFromSite: msg.from.is_bot || false
+              isFromBot: msg.from.is_bot || false
             };
           });
       }
       
-      console.log(`Found ${messages.length} messages`);
+      console.log(`Found ${messages.length} messages from Telegram`);
+      
+      // Добавляем сообщения из нашего хранилища (отправленные с сайта)
+      const siteMessages = [];
+      messageStore.forEach((value, key) => {
+        siteMessages.push(value);
+      });
+      
+      console.log(`Found ${siteMessages.length} messages from site store`);
+      
+      // Объединяем и сортируем
+      const allMessages = [...messages, ...siteMessages]
+        .sort((a, b) => a.date - b.date);
       
       res.status(200).json({ 
         ok: true, 
-        messages: messages,
-        count: messages.length
+        messages: allMessages,
+        count: allMessages.length
       });
       
     } catch (error) {
-      console.error('Error in getMessages:', error);
+      console.error('Error:', error);
       res.status(500).json({ ok: false, error: error.toString() });
     }
     return;
@@ -72,7 +84,7 @@ export default async function handler(req, res) {
   // ===== ОТПРАВКА СООБЩЕНИЯ =====
   if (action === 'sendMessage' && req.method === 'POST') {
     try {
-      const { text, parse_mode } = req.body;
+      const { text, parse_mode, userId, userName } = req.body;
       
       const params = {
         chat_id: CHAT_ID,
@@ -90,10 +102,31 @@ export default async function handler(req, res) {
       });
       
       const data = await response.json();
+      
+      // Сохраняем сообщение в наше хранилище
+      if (data.ok) {
+        const messageId = Date.now();
+        messageStore.set(messageId.toString(), {
+          id: messageId,
+          text: text.replace(/<[^>]*>/g, ''), // очищаем от HTML
+          date: Math.floor(Date.now() / 1000),
+          fromId: userId || 0,
+          fromName: userName || 'User',
+          isFromBot: true,
+          isFromSite: true
+        });
+        
+        // Очищаем старые сообщения (оставляем последние 100)
+        if (messageStore.size > 100) {
+          const keys = Array.from(messageStore.keys()).slice(0, messageStore.size - 100);
+          keys.forEach(key => messageStore.delete(key));
+        }
+      }
+      
       res.status(200).json(data);
       
     } catch (error) {
-      console.error('Error in sendMessage:', error);
+      console.error('Send error:', error);
       res.status(500).json({ error: error.toString() });
     }
     return;
@@ -104,9 +137,9 @@ export default async function handler(req, res) {
     try {
       const { code } = req.query;
       
-      if (authCodes.has(code)) {
-        const user = authCodes.get(code);
-        authCodes.delete(code);
+      if (authStore.has(code)) {
+        const user = authStore.get(code);
+        authStore.delete(code);
         res.status(200).json({ ok: true, user });
       } else {
         res.status(200).json({ ok: false });
@@ -117,11 +150,10 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ===== ВЕБХУК ДЛЯ БОТА =====
+  // ===== ВЕБХУК =====
   if (action === 'webhook' && req.method === 'POST') {
     try {
       const body = req.body;
-      console.log('Webhook received:', body);
       
       if (body.message && body.message.text && body.message.text.startsWith('/start auth_')) {
         const authCode = body.message.text.replace('/start auth_', '');
@@ -131,9 +163,8 @@ export default async function handler(req, res) {
           first_name: body.message.from.first_name
         };
         
-        authCodes.set(authCode, user);
+        authStore.set(authCode, user);
         
-        // Отправляем подтверждение
         await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -143,7 +174,7 @@ export default async function handler(req, res) {
           })
         });
         
-        setTimeout(() => authCodes.delete(authCode), 300000); // 5 минут
+        setTimeout(() => authStore.delete(authCode), 300000);
       }
       
       res.status(200).json({ ok: true });
@@ -154,12 +185,14 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ===== ТЕСТОВЫЙ ЭНДПОИНТ =====
+  // ===== ТЕСТ =====
   if (action === 'test') {
     res.status(200).json({ 
       ok: true, 
       message: 'Proxy is working',
-      chatId: CHAT_ID
+      chatId: CHAT_ID,
+      authCount: authStore.size,
+      messageCount: messageStore.size
     });
     return;
   }
