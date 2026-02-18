@@ -2,7 +2,7 @@
 const TOKEN = '8550352315:AAGSuiM_dm9ycPD2RmrxZjYxqhXL8U8B2A8';
 const CHAT_ID = '-1002168026878';
 
-// Хранилище кодов авторизации (в памяти Vercel, может сбрасываться, но для авторизации этого достаточно)
+// Хранилище кодов авторизации
 const authCodes = new Map();
 
 export default async function handler(req, res) {
@@ -18,7 +18,7 @@ export default async function handler(req, res) {
 
   const { action } = req.query;
 
-  // ===== ПОЛУЧЕНИЕ СООБЩЕНИЙ (КАК В РАБОЧЕЙ ВЕРСИИ) =====
+  // ===== ПОЛУЧЕНИЕ СООБЩЕНИЙ =====
   if (action === 'getMessages') {
     try {
       const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates`);
@@ -37,7 +37,7 @@ export default async function handler(req, res) {
               fromId: from.id,
               fromName: from.first_name + (from.last_name ? ' ' + from.last_name : ''),
               fromUsername: from.username,
-              isFromSite: from.is_bot || false, // true для сообщений, отправленных через бота (с сайта)
+              isFromSite: from.is_bot || false,
               date: msg.date
             };
           });
@@ -50,7 +50,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ===== ОТПРАВКА СООБЩЕНИЯ (КАК В РАБОЧЕЙ ВЕРСИИ, БЕЗ СОХРАНЕНИЯ) =====
+  // ===== ОТПРАВКА СООБЩЕНИЯ =====
   if (action === 'sendMessage' && req.method === 'POST') {
     try {
       const { text, parse_mode } = req.body;
@@ -92,6 +92,8 @@ export default async function handler(req, res) {
   if (action === 'webhook' && req.method === 'POST') {
     try {
       const body = req.body;
+      console.log('Webhook received:', body);
+      
       if (body.message && body.message.text && body.message.text.startsWith('/start auth_')) {
         const authCode = body.message.text.replace('/start auth_', '');
         const user = {
@@ -99,21 +101,44 @@ export default async function handler(req, res) {
           username: body.message.from.username,
           first_name: body.message.from.first_name
         };
+        
+        // Сохраняем пользователя по коду
         authCodes.set(authCode, user);
-
-        // Подтверждение пользователю
+        
+        // Отправляем красивое подтверждение пользователю
+        const displayName = user.username ? `@${user.username}` : user.first_name;
         await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: body.message.chat.id,
-            text: '✅ Авторизация успешна! Можете вернуться на сайт.'
+            text: `✅ Авторизация успешна! Теперь вы можете писать в чат на сайте.\n\nВаш ник: ${displayName}\n👋 Добро пожаловать в КОЕ чат!`,
+            parse_mode: 'HTML'
           })
         });
 
         // Удаляем код через 5 минут
         setTimeout(() => authCodes.delete(authCode), 300000);
+        
+        res.status(200).json({ ok: true });
+        return;
       }
+      
+      // Обработка обычного /start
+      if (body.message && body.message.text === '/start') {
+        await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: body.message.chat.id,
+            text: `👋 Привет! Чтобы авторизоваться на сайте, нажми кнопку "Войти через Telegram" на сайте.`,
+            parse_mode: 'HTML'
+          })
+        });
+        res.status(200).json({ ok: true });
+        return;
+      }
+      
       res.status(200).json({ ok: true });
     } catch (error) {
       console.error('Webhook error:', error);
@@ -124,7 +149,12 @@ export default async function handler(req, res) {
 
   // ===== ТЕСТОВЫЙ ЭНДПОИНТ =====
   if (action === 'test') {
-    res.status(200).json({ ok: true, message: 'Proxy is working' });
+    res.status(200).json({ 
+      ok: true, 
+      message: 'Proxy is working',
+      chatId: CHAT_ID,
+      authCodesCount: authCodes.size
+    });
     return;
   }
 
