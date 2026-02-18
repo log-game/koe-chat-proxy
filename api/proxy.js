@@ -1,14 +1,12 @@
-// api/proxy.js - Полная версия с поддержкой авторизации
+// api/proxy.js - Полная версия с поддержкой авторизации и правильным отображением
 const TOKEN = '8550352315:AAEQ0Ixpe17_YEWiJD4RLhAs5BbqIoUirmY';
 const CHAT_ID = '-1002168026878';
 
-// Хранилище для временных кодов авторизации (вне функции, чтобы сохранялось между запросами)
-// ВНИМАНИЕ: Это in-memory хранилище, которое сбрасывается при перезапуске сервера
-// Для продакшена лучше использовать Redis или другую БД
+// Хранилище для временных кодов авторизации
 const authCodes = new Map();
 
-// Хранилище для сообщений с сайта
-let siteMessages = [];
+// Хранилище для истории отправленных сообщений с сайта (чтобы избежать дублирования)
+const sentMessages = new Map(); // key: userId_timestamp, value: true
 
 export default async function handler(req, res) {
   // Настройки CORS
@@ -16,7 +14,6 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Обработка preflight запросов
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
@@ -31,22 +28,7 @@ export default async function handler(req, res) {
       
       if (authCodes.has(code)) {
         const user = authCodes.get(code);
-        authCodes.delete(code); // Код одноразовый
-        
-        // Отправляем приветственное сообщение в личку
-        try {
-          await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: user.id,
-              text: `👋 Добро пожаловать в КОЕ чат! Теперь вы можете писать сообщения с сайта.`,
-              parse_mode: 'HTML'
-            })
-          });
-        } catch (e) {
-          console.log('Не удалось отправить приветствие');
-        }
+        authCodes.delete(code);
         
         res.status(200).json({ ok: true, user });
       } else {
@@ -67,28 +49,42 @@ export default async function handler(req, res) {
       let telegramMessages = [];
       if (data.ok && data.result) {
         telegramMessages = data.result
-          .filter(item => item.message && item.message.chat.id == CHAT_ID)
+          .filter(item => {
+            // Показываем только сообщения из нашего чата
+            return item.message && item.message.chat.id == CHAT_ID;
+          })
           .map(item => {
             const msg = item.message;
             const from = msg.from;
             
+            // Определяем, от кого сообщение
+            let messageType = 'other';
+            let userId = from.id;
+            
+            // Если сообщение от бота - проверяем, не с сайта ли оно
+            if (from.is_bot) {
+              // Сообщения от бота считаем "с сайта"
+              messageType = 'site';
+            }
+            
             return {
               id: msg.message_id,
               text: msg.text || '',
-              fromId: from.id,
-              fromName: from.first_name,
-              fromUsername: from.username,
-              isFromSite: from.is_bot || false,
-              date: msg.date
+              userId: userId,
+              userFirstName: from.first_name,
+              userUsername: from.username,
+              messageType: messageType, // 'site' или 'other'
+              date: msg.date,
+              raw: msg // сохраняем для отладки
             };
           });
       }
       
-      // Объединяем с сообщениями с сайта
-      const allMessages = [...telegramMessages, ...siteMessages]
-        .sort((a, b) => a.date - b.date);
-      
-      res.status(200).json({ ok: true, messages: allMessages });
+      res.status(200).json({ 
+        ok: true, 
+        messages: telegramMessages,
+        count: telegramMessages.length
+      });
     } catch (error) {
       res.status(500).json({ ok: false, error: error.toString() });
     }
@@ -98,7 +94,11 @@ export default async function handler(req, res) {
   // ===== ОТПРАВКА СООБЩЕНИЯ =====
   if (action === 'sendMessage' && req.method === 'POST') {
     try {
-      const { text, parse_mode } = req.body;
+      const { text, parse_mode, userId, username } = req.body;
+      
+      // Проверяем, не забанен ли пользователь
+      // В реальном проекте здесь должна быть проверка через Telegram API
+      // Сейчас просто пропускаем
       
       const params = {
         chat_id: CHAT_ID,
@@ -117,33 +117,24 @@ export default async function handler(req, res) {
       
       const data = await response.json();
       
-      // Сохраняем локально для мгновенного отображения
-      if (data.ok) {
-        const cleanText = text.replace(/<[^>]*>/g, '');
-        siteMessages.push({
-          id: `site_${Date.now()}`,
-          text: cleanText,
-          fromId: 0,
-          fromName: 'Сайт',
-          fromUsername: 'site',
-          isFromSite: true,
-          date: Math.floor(Date.now() / 1000)
-        });
-        
-        // Ограничиваем историю
-        if (siteMessages.length > 100) {
-          siteMessages = siteMessages.slice(-100);
-        }
-      }
+      // Создаем уникальный ключ для этого сообщения
+      const messageKey = `${userId}_${Date.now()}`;
+      sentMessages.set(messageKey, true);
+      
+      // Очищаем старые записи через 1 минуту
+      setTimeout(() => {
+        sentMessages.delete(messageKey);
+      }, 60000);
       
       res.status(200).json(data);
     } catch (error) {
+      console.error('Send message error:', error);
       res.status(500).json({ error: error.toString() });
     }
     return;
   }
 
-  // ===== ОБРАБОТКА ВЕБХУКА (ДЛЯ КОМАНД ОТ БОТА) =====
+  // ===== ОБРАБОТКА ВЕБХУКА =====
   if (action === 'webhook' && req.method === 'POST') {
     try {
       const body = req.body;
@@ -159,7 +150,6 @@ export default async function handler(req, res) {
           last_name: body.message.from.last_name
         };
         
-        // Сохраняем код авторизации (на 5 минут)
         authCodes.set(authCode, user);
         
         // Удаляем через 5 минут
@@ -167,29 +157,13 @@ export default async function handler(req, res) {
           authCodes.delete(authCode);
         }, 5 * 60 * 1000);
         
-        // Отправляем подтверждение пользователю
+        // Отправляем подтверждение
         await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: body.message.chat.id,
-            text: `✅ Авторизация успешна! Теперь вы можете писать в чат на сайте.\n\nВаш ник: ${user.username ? '@' + user.username : user.first_name}`,
-            parse_mode: 'HTML'
-          })
-        });
-        
-        res.status(200).json({ ok: true });
-        return;
-      }
-      
-      // Обработка обычного /start
-      if (body.message && body.message.text === '/start') {
-        await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: body.message.chat.id,
-            text: `👋 Привет! Чтобы авторизоваться на сайте, перейди по ссылке с сайта.`,
+            text: `✅ Авторизация успешна! Теперь вы можете писать в чат на сайте.`,
             parse_mode: 'HTML'
           })
         });
@@ -211,13 +185,12 @@ export default async function handler(req, res) {
     res.status(200).json({ 
       ok: true, 
       message: 'Proxy is working',
-      authCodesCount: authCodes.size,
-      siteMessagesCount: siteMessages.length
+      chatId: CHAT_ID,
+      authCodesCount: authCodes.size
     });
     return;
   }
 
-  // ===== НЕИЗВЕСТНОЕ ДЕЙСТВИЕ =====
   res.status(404).json({ 
     error: 'Action not found',
     availableActions: ['test', 'getMessages', 'sendMessage', 'checkAuth', 'webhook']
