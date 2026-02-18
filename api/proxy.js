@@ -1,15 +1,11 @@
-// api/proxy.js - ПОЛНАЯ РАБОЧАЯ ВЕРСИЯ
-const TOKEN = '8550352315:AAEQ0Ixpe17_YEWiJD4RLhAs5BbqIoUirmY';
-const CHAT_ID = '-1002168026878'; // ID супергруппы КОЕ ЧАТ
-
-// Хранилища (в памяти Vercel)
-const authCodes = new Map(); // коды авторизации
-const siteMessages = []; // сообщения с сайта
-const userSpam = new Map(); // для анти-спама { userId: [timestamps] }
-const bannedUsers = new Set(); // заглушка для банов (в реальности нужно получать из Telegram)
-
+// api/proxy.js - Версия с авторизацией через Telegram
 export default async function handler(req, res) {
-  // CORS настройки
+  // ===== НАСТРОЙКИ =====
+  const TOKEN = '8550352315:AAEQ0Ixpe17_YEWiJD4RLhAs5BbqIoUirmY';
+  const CHAT_ID = '-1002168026878'; // ID супергруппы КОЕ ЧАТ
+  const BOT_USERNAME = 'YourBotUsername'; // !!! ЗАМЕНИТЕ НА ИМЯ ВАШЕГО БОТА (без @)
+
+  // Настройки CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -21,202 +17,154 @@ export default async function handler(req, res) {
 
   const { action } = req.query;
 
-  // ===== 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ =====
-  if (action === 'getMessages') {
+  // ===== 1. ПРОВЕРКА СТАТУСА ПОЛЬЗОВАТЕЛЯ =====
+  if (action === 'checkUser' && req.method === 'POST') {
     try {
-      const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates`);
-      const data = await response.json();
-      
-      let telegramMessages = [];
-      if (data.ok && data.result) {
-        telegramMessages = data.result
-          .filter(item => item.message && item.message.chat.id == CHAT_ID)
-          .map(item => {
-            const msg = item.message;
-            const from = msg.from;
-            
-            return {
-              id: msg.message_id,
-              text: msg.text || '',
-              fromId: from.id,
-              fromName: from.first_name + (from.last_name ? ' ' + from.last_name : ''),
-              fromUsername: from.username,
-              isFromSite: from.is_bot || false,
-              date: msg.date
-            };
-          });
+      const { userId } = req.body;
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'userId is required' });
       }
-      
-      // Объединяем с сообщениями с сайта
-      const allMessages = [...siteMessages, ...telegramMessages]
-        .sort((a, b) => a.date - b.date);
-      
-      res.status(200).json({ ok: true, messages: allMessages });
-    } catch (error) {
-      res.status(500).json({ ok: false, error: error.toString() });
-    }
-    return;
-  }
 
-  // ===== 2. ОТПРАВКА СООБЩЕНИЯ =====
-  if (action === 'sendMessage' && req.method === 'POST') {
-    try {
-      const { text, parse_mode, userId, username, first_name } = req.body;
-      
-      // ===== АНТИ-СПАМ ПРОВЕРКА =====
-      const now = Date.now();
-      const userTimestamps = userSpam.get(userId) || [];
-      const recentMessages = userTimestamps.filter(t => now - t < 60000); // за последнюю минуту
-      
-      if (recentMessages.length >= 5) {
-        res.status(429).json({ 
-          ok: false, 
-          error: 'SPAM_LIMIT',
-          message: 'Слишком много сообщений. Подождите минуту.'
-        });
-        return;
-      }
-      
-      // ===== ПРОВЕРКА БАНА/МУТА =====
-      // В реальности нужно проверять через Telegram API статус участника
-      // Это заглушка - проверяем наличие в Set
-      if (bannedUsers.has(userId)) {
-        res.status(403).json({ 
-          ok: false, 
-          error: 'USER_BANNED',
-          message: 'Вы забанены в чате'
-        });
-        return;
-      }
-      
-      // Формируем имя для отображения
-      const displayName = username ? `@${username}` : (first_name || 'Пользователь');
-      const messageText = `<a href="tg://user?id=${userId}">${displayName}</a>: ${text}`;
-      
-      // Отправляем в Telegram
-      const params = {
-        chat_id: CHAT_ID,
-        text: messageText,
-        parse_mode: 'HTML'
-      };
-      
-      const response = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+      // 1. Проверяем, является ли пользователь участником чата и не забанен ли он
+      // К сожалению, Telegram Bot API не имеет метода для прямой проверки бана.
+      // Мы можем использовать getChatMember, который вернет статус пользователя.
+      const memberResponse = await fetch(`https://api.telegram.org/bot${TOKEN}/getChatMember`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params)
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          user_id: Number(userId)
+        })
       });
       
-      const data = await response.json();
+      const memberData = await memberResponse.json();
       
-      // Если успешно - сохраняем
-      if (data.ok) {
-        // Обновляем спам-счетчик
-        userTimestamps.push(now);
-        userSpam.set(userId, userTimestamps.filter(t => now - t < 60000));
-        
-        // Сохраняем сообщение локально
-        siteMessages.push({
-          id: `site_${Date.now()}`,
-          text: text,
-          fromId: userId,
-          fromName: displayName,
-          fromUsername: username,
-          isFromSite: true,
-          date: Math.floor(now / 1000)
+      if (!memberData.ok) {
+        // Пользователь не найден в чате или произошла ошибка
+        return res.status(200).json({ 
+          ok: true, 
+          isMember: false, 
+          canSend: false,
+          status: 'left' 
         });
-        
-        // Ограничиваем историю
-        if (siteMessages.length > 100) {
-          siteMessages.splice(0, siteMessages.length - 100);
-        }
       }
+
+      const status = memberData.result.status;
+      // Статусы: 'creator', 'administrator', 'member', 'restricted', 'left', 'kicked'
+      const isMember = ['creator', 'administrator', 'member', 'restricted'].includes(status);
+      // Отправлять могут создатели, админы и обычные участники (member).
+      // Если пользователь restricted (ограничен), нужно проверить, может ли он писать.
+      let canSend = ['creator', 'administrator', 'member'].includes(status);
       
-      res.status(200).json(data);
+      // Для restricted проверяем отдельно права
+      if (status === 'restricted' && memberData.result.permissions) {
+        canSend = memberData.result.permissions.can_send_messages === true;
+      }
+
+      res.status(200).json({
+        ok: true,
+        isMember: isMember,
+        canSend: canSend,
+        status: status,
+        user: memberData.result.user
+      });
+
     } catch (error) {
       res.status(500).json({ ok: false, error: error.toString() });
     }
-    return;
   }
 
-  // ===== 3. АВТОРИЗАЦИЯ =====
-  if (action === 'checkAuth') {
-    try {
-      const { code } = req.query;
-      
-      if (authCodes.has(code)) {
-        const user = authCodes.get(code);
-        authCodes.delete(code);
-        res.status(200).json({ ok: true, user });
-      } else {
-        res.status(200).json({ ok: false });
-      }
-    } catch (error) {
-      res.status(500).json({ ok: false, error: error.toString() });
-    }
-    return;
-  }
-
-  // ===== 4. ВЕБХУК ДЛЯ БОТА =====
-  if (action === 'webhook' && req.method === 'POST') {
-    try {
-      const body = req.body;
-      
-      if (body.message && body.message.text && body.message.text.startsWith('/start auth_')) {
-        const authCode = body.message.text.replace('/start auth_', '');
-        const user = {
-          id: body.message.from.id,
-          username: body.message.from.username,
-          first_name: body.message.from.first_name
-        };
-        
-        authCodes.set(authCode, user);
-        
-        await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: body.message.chat.id,
-            text: '✅ Авторизация успешна! Можете вернуться на сайт.'
-          })
-        });
-        
-        setTimeout(() => authCodes.delete(authCode), 300000); // 5 минут
-      }
-      
-      res.status(200).json({ ok: true });
-    } catch (error) {
-      console.error('Webhook error:', error);
-      res.status(500).json({ error: error.toString() });
-    }
-    return;
-  }
-
-  // ===== 5. ТЕСТОВЫЙ ЭНДПОИНТ =====
-  if (action === 'test') {
-    res.status(200).json({ 
-      ok: true, 
-      message: 'Proxy is working',
-      chatId: CHAT_ID,
-      time: Date.now()
-    });
-    return;
-  }
-
-  // ===== 6. GET UPDATES ДЛЯ СОВМЕСТИМОСТИ =====
-  if (action === 'getUpdates') {
+  // ===== 2. ПОЛУЧЕНИЕ СООБЩЕНИЙ =====
+  else if (action === 'getMessages') {
     try {
       const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates`);
       const data = await response.json();
-      res.status(200).json(data);
+      
+      let messages = [];
+      if (data.ok && data.result) {
+        messages = data.result
+          .filter(item => item.message && item.message.chat.id == CHAT_ID && item.message.text)
+          .map(item => {
+            const msg = item.message;
+            return {
+              id: msg.message_id,
+              text: msg.text,
+              fromId: msg.from.id,
+              fromName: msg.from.first_name,
+              date: msg.date
+            };
+          })
+          .slice(-50); // Последние 50 сообщений
+      }
+      
+      res.status(200).json({ ok: true, messages: messages });
     } catch (error) {
       res.status(500).json({ ok: false, error: error.toString() });
     }
-    return;
   }
 
-  res.status(404).json({ 
-    ok: false, 
-    error: 'Action not found',
-    availableActions: ['test', 'getMessages', 'getUpdates', 'sendMessage', 'checkAuth', 'webhook']
-  });
+  // ===== 3. ОТПРАВКА СООБЩЕНИЯ =====
+  else if (action === 'sendMessage' && req.method === 'POST') {
+    try {
+      const { text, userId, userName } = req.body;
+      
+      if (!userId) {
+        return res.status(403).json({ ok: false, error: 'User not authenticated' });
+      }
+
+      // Сначала проверяем, может ли пользователь писать
+      const checkResponse = await fetch(`${process.env.VERCEL_URL || 'https://koe-chat-proxy.vercel.app'}/api/proxy?action=checkUser`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId })
+      });
+      
+      const checkData = await checkResponse.json();
+      
+      if (!checkData.ok || !checkData.canSend) {
+        return res.status(403).json({ 
+          ok: false, 
+          error: 'You are not allowed to send messages in this chat' 
+        });
+      }
+
+      // Формируем ссылку на профиль пользователя
+      const userLink = `tg://user?id=${userId}`;
+      // Или можно использовать обычную ссылку: `https://t.me/${userName}` если есть username
+      
+      const messageText = `<a href="${userLink}">${userName || 'User'}</a>: ${text}`;
+      
+      const sendResponse = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          text: messageText,
+          parse_mode: 'HTML'
+        })
+      });
+      
+      const sendData = await sendResponse.json();
+      res.status(200).json(sendData);
+      
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.toString() });
+    }
+  }
+
+  // ===== 4. ТЕСТОВЫЙ ЭНДПОИНТ =====
+  else if (action === 'test') {
+    res.status(200).json({ 
+      ok: true, 
+      message: 'Proxy is working with auth',
+      chatId: CHAT_ID
+    });
+  }
+
+  else {
+    res.status(404).json({ 
+      ok: false, 
+      error: 'Action not found'
+    });
+  }
 }
